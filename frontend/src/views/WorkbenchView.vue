@@ -90,6 +90,8 @@
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <DecimalMigrationPanel v-if="meta.key === 'schema_sync'" />
   </section>
 </template>
 
@@ -103,6 +105,7 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import DecimalMigrationPanel from '@/components/DecimalMigrationPanel.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()

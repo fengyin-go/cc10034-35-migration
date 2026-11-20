@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services import column_ledger
 from app.pipeline import DdlRecord, pipeline_bus
 
 
@@ -30,12 +31,17 @@ class DdlTrackerService(BaseModuleService):
         解析 DDL 语句中的列变化、分区变化、索引变化，
         产出影响报告供 schema_sync 和 partition_sync 消费。
         """
-        ddl_text = ddl.ddl_statement.upper()
+        # 保留原始大小写：列名要能对上列变更清单里的键，正则本身已用 IGNORECASE。
+        ddl_text = ddl.ddl_statement
         column_changes: list[dict[str, Any]] = []
         partition_changes: list[dict[str, Any]] = []
 
+        # 列名 + 类型；类型后面允许带精度括号：DECIMAL(19,4) 不能被截成 DECIMAL。
+        column_type_pattern = r"`?(\w+)`?\s+`?(\w+)`?(?:\s*\([^)]*\))?"
+
         # 检测 ADD COLUMN
-        add_cols = re.findall(r'ADD\s+COLUMN\s+(\w+)\s+(\w+)', ddl_text, re.IGNORECASE)
+        add_cols = re.findall(
+            rf'ADD\s+COLUMN\s+{column_type_pattern}', ddl_text, re.IGNORECASE)
         for col_name, col_type in add_cols:
             column_changes.append({"action": "add", "column": col_name, "type": col_type})
             ddl.column_changes.append({"action": "add", "column": col_name, "type": col_type})
@@ -46,12 +52,46 @@ class DdlTrackerService(BaseModuleService):
             column_changes.append({"action": "drop", "column": col_name})
             ddl.column_changes.append({"action": "drop", "column": col_name})
 
-        # 检测 MODIFY COLUMN / CHANGE COLUMN
-        modify_cols = re.findall(r'(?:MODIFY|CHANGE)\s+(?:COLUMN\s+)?(\w+)\s+(\w+)\s+(\w+)',
-                                 ddl_text, re.IGNORECASE)
-        for old_name, new_name, col_type in modify_cols:
+        # 检测 MODIFY COLUMN（列名 + 新类型）
+        modify_cols = re.findall(
+            rf'MODIFY\s+(?:COLUMN\s+)?{column_type_pattern}', ddl_text, re.IGNORECASE)
+        for col_name, col_type in modify_cols:
+            column_changes.append({"action": "modify", "column": col_name, "new_type": col_type})
+            ddl.column_changes.append({"action": "modify", "column": col_name, "new_type": col_type})
+
+        # 检测 CHANGE COLUMN（旧名 + 新名 + 新类型）
+        change_cols = re.findall(
+            rf'CHANGE\s+(?:COLUMN\s+)?`?(\w+)`?\s+{column_type_pattern}', ddl_text, re.IGNORECASE)
+        for old_name, new_name, col_type in change_cols:
             column_changes.append({"action": "modify", "column": old_name, "new_type": col_type})
             ddl.column_changes.append({"action": "modify", "column": old_name, "new_type": col_type})
+
+        # DECIMAL 列：把数据库原始定义（含 p,s）原样登记到列变更清单，
+        # 不做任何固定精度转换，供 Schema同步 生成保留源精度的目标映射。
+        decimal_columns = column_ledger.capture_from_ddl(
+            database=ddl.database,
+            table=ddl.table_name,
+            ddl_statement=ddl.ddl_statement,
+            ddl_record_id=ddl.record_id,
+        )
+        for entry in decimal_columns:
+            # 用清单里的完整定义覆盖正则截断出来的类型，保证 Schema同步 拿到 p,s。
+            existing = next(
+                (change for change in column_changes
+                 if str(change.get("column", "")).casefold() == entry["column"].casefold()),
+                None,
+            )
+            if existing is None:
+                column_changes.append({
+                    "action": "modify",
+                    "column": entry["column"],
+                    "new_type": entry["source_type"],
+                    "source_definition": entry["source_definition"],
+                })
+            else:
+                existing["new_type"] = entry["source_type"]
+                existing["type"] = entry["source_type"]
+                existing["source_definition"] = entry["source_definition"]
 
         # 检测 ADD PARTITION
         add_part = re.findall(r'ADD\s+PARTITION', ddl_text, re.IGNORECASE)
@@ -73,6 +113,14 @@ class DdlTrackerService(BaseModuleService):
             "database": ddl.database,
             "table": ddl.table_name,
             "column_changes": column_changes,
+            "decimal_columns": [
+                {
+                    "column": entry["column"],
+                    "source_definition": entry["source_definition"],
+                    "source_type": entry["source_type"],
+                }
+                for entry in decimal_columns
+            ],
             "partition_changes": partition_changes,
             "affected_columns": affected_cols,
             "rollback_statement": rollback,
@@ -87,7 +135,8 @@ class DdlTrackerService(BaseModuleService):
                 pipeline_bus.schema_registry.setdefault(ddl.table_name, []).append({
                     "column": cc.get("column"),
                     "action": cc.get("action"),
-                    "type": cc.get("type", ""),
+                    "type": cc.get("type") or cc.get("new_type", ""),
+                    "source_definition": cc.get("source_definition", ""),
                     "timestamp": datetime.now().isoformat(),
                 })
 

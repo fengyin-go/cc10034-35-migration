@@ -82,6 +82,11 @@ class PipelineBus:
         self.checkpoints: list[CheckpointRecord] = []
         # Schema 注册 — schema_sync 写入，ddl_tracker/format_adapter 消费
         self.schema_registry: dict[str, list[dict[str, Any]]] = {}
+        # 列变更清单 — ddl_tracker/schema_sync 共同维护，记录数据库原始列定义，
+        # 以及每次迁移执行结果，供下一次部署查询原定义、按原版本复查已上线映射。
+        self.column_changes: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+        # 小数列迁移记录（新版）— schema_sync 产出，按批次+列+版本去重
+        self.decimal_migrations: list[dict[str, Any]] = []
         # SCD 状态 — scd_handler 核心存储
         self.scd_type1_store: dict[str, dict[str, Any]] = {}  # snapshot
         self.scd_type2_store: dict[str, list[dict[str, Any]]] = {}  # history

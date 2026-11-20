@@ -9,6 +9,8 @@ from datetime import datetime
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services import column_ledger
+from app.decimal_types import DecimalType
 from app.pipeline import pipeline_bus
 
 
@@ -25,7 +27,7 @@ class SchemaSyncService(BaseModuleService):
     def build_sync_plan(self, config: dict[str, Any]) -> dict[str, Any]:
         """根据源Schema和DDL变更结果构建同步计划。
 
-        读取 ddl_tracker 产出的 schema_registry 中已注册的列变更，
+        读取 ddl_tracker 产出的 schema_registry / 列变更清单中已登记的列变更，
         结合类型转换策略、冲突策略生成同步任务。
         """
         source_table = config.get("源表", "")
@@ -36,10 +38,12 @@ class SchemaSyncService(BaseModuleService):
         source_cols = pipeline_bus.schema_registry.get(source_table, [])
         col_mapping: list[dict[str, Any]] = []
         for col_info in source_cols:
-            target_type = self.convert_type(col_info.get("type", "VARCHAR"), type_conversion)
+            source_type = col_info.get("type") or col_info.get("source_definition", "")
+            target_type = self.convert_type(source_type, type_conversion)
             col_mapping.append({
                 "source_column": col_info.get("column"),
-                "source_type": col_info.get("type"),
+                "source_type": source_type,
+                "source_definition": col_info.get("source_definition", ""),
                 "target_type": target_type,
                 "action": col_info.get("action"),
             })
@@ -61,13 +65,25 @@ class SchemaSyncService(BaseModuleService):
         """类型转换策略执行。
 
         支持的转换：mysql->hive/postgresql/doris 等目标格式。
+
+        DECIMAL 不再固定成 DECIMAL(38,18)：从源定义里解析出完整的
+        DECIMAL(p,s) 并保留，只有解析不到精度时才回落到显式默认值。
         """
         source_upper = source_type.upper()
+        decimal_type = DecimalType.parse(source_type)
+        if decimal_type is not None or "DECIMAL" in source_upper:
+            if decimal_type is None:
+                # 无参 DECIMAL 按 MySQL 默认 DECIMAL(10,0) 处理，而不是 38,18。
+                decimal_type = DecimalType(10, 0)
+            errors = decimal_type.definition_errors(hive=strategy.lower() in ("hive", "直接映射"))
+            if errors:
+                return source_type
+            return str(decimal_type)
+
         type_map = {
             "VARCHAR": {"直接映射": "STRING", "hive": "STRING", "doris": "VARCHAR(65533)"},
             "INT": {"直接映射": "INT", "hive": "INT", "doris": "INT"},
             "BIGINT": {"直接映射": "BIGINT", "hive": "BIGINT", "doris": "BIGINT"},
-            "DECIMAL": {"直接映射": "DECIMAL(38,18)", "hive": "DECIMAL(38,18)", "doris": "DECIMAL(38,18)"},
             "DATETIME": {"直接映射": "TIMESTAMP", "hive": "TIMESTAMP", "doris": "DATETIME"},
             "TEXT": {"直接映射": "STRING", "hive": "STRING", "doris": "STRING"},
             "JSON": {"直接映射": "STRING", "hive": "STRING", "doris": "JSON"},
@@ -97,7 +113,7 @@ class SchemaSyncService(BaseModuleService):
         }
 
     def generate_sync_ddl(self, col_mapping: list[dict[str, Any]], target_table: str) -> str:
-        """根据列映射生成目标DDL。"""
+        """根据列映射生成目标DDL（Hive 语法，DECIMAL 保留源精度）。"""
         cols: list[str] = []
         for cm in col_mapping:
             if cm.get("action") == "drop":
@@ -107,15 +123,99 @@ class SchemaSyncService(BaseModuleService):
             return f"-- 无新增列，目标表 {target_table} 不变"
         return f"ALTER TABLE {target_table} ADD COLUMNS (\n" + ",\n".join(cols) + "\n);"
 
+    def build_hive_column_statements(
+        self,
+        col_mapping: list[dict[str, Any]],
+        target_table: str,
+        *,
+        existing_columns: dict[str, str] | None = None,
+    ) -> list[str]:
+        """为已有列生成 Hive CHANGE COLUMN 语句；新列走 ADD COLUMNS。
+
+        与 generate_sync_ddl 的区别：这里按目标表现有列定义选择语法，
+        已存在的 DECIMAL 列不会被追加成第二列，而是原地改类型。
+        """
+        existing_columns = existing_columns or {}
+        add_cols: list[str] = []
+        statements: list[str] = []
+        for cm in col_mapping:
+            if cm.get("action") == "drop":
+                continue
+            name = cm["source_column"]
+            target_type = cm["target_type"]
+            if name in existing_columns:
+                statements.append(
+                    f"ALTER TABLE {target_table} CHANGE COLUMN {name} {name} {target_type};"
+                )
+            else:
+                add_cols.append(f"  {name} {target_type}")
+        if add_cols:
+            statements.append(
+                f"ALTER TABLE {target_table} ADD COLUMNS (\n" + ",\n".join(add_cols) + "\n);"
+            )
+        if not statements:
+            return [f"-- 无新增列，目标表 {target_table} 不变"]
+        return statements
+
+    def generate_decimal_migration_records(
+        self,
+        source_table: str,
+        target_table: str,
+        *,
+        release_version: int = 2,
+        existing_columns: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """基于列变更清单里的原始 DECIMAL(p,s) 生成新版小数列迁移记录。
+
+        上游 DDL追踪 已经把数据库原始定义写进列变更清单；这里只负责
+        转成目标 SQL 和迁移记录，不再假定 DECIMAL(38,18)。
+        """
+        ledger = column_ledger.column_changes(target_table).get(target_table, {})
+        records: list[dict[str, Any]] = []
+        for column, entry in ledger.items():
+            source_type = DecimalType.parse(entry.get("source_type"))
+            if source_type is None:
+                continue
+            target_type = str(source_type)
+            record = {
+                "record_id": f"dcm_{source_table}_{column}_v{release_version}",
+                "source_table": source_table,
+                "target_table": target_table,
+                "column": column,
+                "source_definition": entry.get("source_definition"),
+                "source_type": target_type,
+                "original_precision": source_type.precision,
+                "original_scale": source_type.scale,
+                "legacy_target_type": entry.get("mapping_type", "DECIMAL(38,18)"),
+                "target_type": target_type,
+                "mapping_kind": "保留源精度",
+                "release_version": release_version,
+                "statement": f"ALTER TABLE {target_table} CHANGE COLUMN {column} {column} {target_type};",
+                "status": "待执行",
+                "effective": False,
+            }
+            records.append(record)
+        pipeline_bus.decimal_migrations.extend(records)
+        return records
+
     def detect_type_conflict(self, col_name: str, source_type: str, target_type: str) -> dict[str, Any]:
-        """检测列类型冲突。"""
+        """检测列类型冲突；DECIMAL 要比整数位和小数位，不能只看类型名。"""
         has_conflict = source_type.upper() != target_type.upper()
         resolution = ""
         if has_conflict:
+            source_decimal = DecimalType.parse(source_type)
+            target_decimal = DecimalType.parse(target_type)
             if "VARCHAR" in source_type.upper() and "STRING" in target_type.upper():
                 resolution = "字符串宽度调整，无数据丢失"
             elif "DECIMAL" in source_type.upper() and "BIGINT" in target_type.upper():
                 resolution = "精度可能丢失，建议保留DECIMAL"
+            elif source_decimal and target_decimal:
+                if target_decimal.integer_digits < source_decimal.integer_digits:
+                    resolution = "目标整数位不足，存量值可能被截断，禁止迁移"
+                elif target_decimal.scale != source_decimal.scale:
+                    resolution = "目标小数位与源不一致，存量值可能被舍入，禁止迁移"
+                else:
+                    resolution = "整数位与小数位一致，可无损迁移"
             else:
                 resolution = "建议人工确认类型转换"
         return {
